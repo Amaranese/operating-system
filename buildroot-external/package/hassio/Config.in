@@ -1,0 +1,21 @@
+menuconfig BR2_PACKAGE_HASSIO
+	bool "Supervisor App"
+	help
+	  This is the Application layer they build the
+	  data partition with configurations.
+
+	  https://github.com/home-assistant/supervisor
+
+if BR2_PACKAGE_HASSIO
+
+config BR2_PACKAGE_HASSIO_ARCH
+	string "Supervisor Arch"
+	help
+	  Supervisor architecture which should be pull.
+
+config BR2_PACKAGE_HASSIO_MACHINE
+	string "Supervisor Machine"
+	help
+	  Machine to pull containers for (used for landing page).
+
+endif

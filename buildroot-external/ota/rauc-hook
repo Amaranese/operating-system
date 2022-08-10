@@ -1,0 +1,136 @@
+#!/bin/sh
+
+set -o errexit
+
+install_boot() {
+    BOOT_TMP=/tmp/boot-tmp
+    BOOT_NEW=/tmp/boot-new
+    BOOT_MNT=/mnt/boot
+
+    mkdir -p "${BOOT_TMP}"
+    mkdir -p "${BOOT_NEW}"
+
+    # Mount boot
+    if ! systemctl -q is-active mnt-boot.mount; then
+        systemctl start mnt-boot.mount
+    fi
+    mount "${RAUC_IMAGE_NAME}" "${BOOT_NEW}"
+
+    # Backup boot config
+    cp -f "${BOOT_MNT}"/*.txt "${BOOT_TMP}/" || true
+
+    # Update
+    cp -rf "${BOOT_NEW}"/* "${BOOT_MNT}/"
+
+    # Restore boot config
+    cp -f "${BOOT_TMP}"/*.txt "${BOOT_MNT}/" || true
+
+    umount "${BOOT_NEW}"
+    rm -rf "${BOOT_TMP}" "${BOOT_NEW}"
+}
+
+install_spl() {
+    DEVICE_CHILD="$(findfs LABEL="hassos-boot")"
+    DEVICE_ROOT="/dev/$(lsblk -no pkname "${DEVICE_CHILD}")"
+    PART_TABLE="$(sfdisk -lqJ "${DEVICE_ROOT}")"
+    PART_LABEL="$(echo "${PART_TABLE}" | jq -r '.partitiontable.label')"
+    FLAGS=""
+
+    if dd oflag=direct if=/dev/null 2> /dev/null; then
+        FLAGS="oflag=direct"
+    fi
+
+    if [ "${PART_LABEL}" = "gpt" ]; then
+        dd if="${RAUC_IMAGE_NAME}" of="${DEVICE_ROOT}" conv=notrunc ${FLAGS} bs=512 seek=2 skip=2
+    else
+        dd if="${RAUC_IMAGE_NAME}" of="${DEVICE_ROOT}" conv=notrunc ${FLAGS} bs=1 count=440
+        dd if="${RAUC_IMAGE_NAME}" of="${DEVICE_ROOT}" conv=notrunc ${FLAGS} bs=512 seek=1 skip=1
+    fi
+
+    # Flash to eMMC boot partition if necessary
+    if [ "$RAUC_SYSTEM_COMPATIBLE" = "haos-odroid-xu4" ] && [ -b "${DEVICE_ROOT}boot0" ]; then
+        echo "Updating eMMC boot partition"
+        echo 0 > /sys/block/"$(basename "${DEVICE_ROOT}boot0")"/force_ro
+        dd if="${RAUC_IMAGE_NAME}" of="${DEVICE_ROOT}boot0" conv=notrunc ${FLAGS} bs=512 skip=1 count=2047
+        echo 1 > /sys/block/"$(basename "${DEVICE_ROOT}boot0")"/force_ro
+    fi
+}
+
+check_grubenv() {
+    BOOT_MNT=/mnt/boot
+
+    # Mount boot
+    if ! systemctl -q is-active mnt-boot.mount; then
+        systemctl start mnt-boot.mount
+    fi
+
+    # If GRUB is installed, check if GRUB environment has been currupted
+    if command -v grub-editenv > /dev/null; then
+        if ! grub-editenv "${BOOT_MNT}/EFI/BOOT/grubenv" list > /dev/null; then
+            echo "GRUB environment seems to be corrupted. Recreating a new environment."
+            grub-editenv "${BOOT_MNT}"/EFI/BOOT/grubenv create
+        fi
+    fi
+}
+
+post_install_kernel() {
+    BOOT_MNT=/mnt/boot
+
+    # Mount boot
+    if ! systemctl -q is-active mnt-boot.mount; then
+        systemctl start mnt-boot.mount
+    fi
+
+    # OS 7 -> 8 upgrade path:
+    # If grub is installed, and the current system lacks GRUB environment
+    # manipulation tools, manually create a grubenv for the right boot slot
+    if [ -f "${BOOT_MNT}"/EFI/BOOT/grub.cfg ] && ! command -v grub-editenv > /dev/null; then
+        cp -f "${BOOT_MNT}/EFI/BOOT/grubenv-${RAUC_SLOT_BOOTNAME}" "${BOOT_MNT}"/EFI/BOOT/grubenv
+        echo "Copied default GRUB environment grubenv-${RAUC_SLOT_BOOTNAME} as grubenv."
+    fi
+}
+
+##
+# Hooks
+
+case "$1" in
+     install-check)
+         if [ "$RAUC_MF_COMPATIBLE" = "$RAUC_SYSTEM_COMPATIBLE" ]; then
+             # Check if GRUB env has been corrupted. This is only problematic
+             # with OS 8, where compatible matches.
+             check_grubenv
+             exit 0
+         fi
+         # Be compatible with hassos OS ID
+         # shellcheck disable=SC3060
+         rauc_os_compatible=${RAUC_MF_COMPATIBLE/haos-/hassos-}
+         if [ "$rauc_os_compatible" = "$RAUC_SYSTEM_COMPATIBLE" ]; then
+             exit 0
+         fi
+         # generic-x86-64: Be compatible with intel-nuc
+         # shellcheck disable=SC3060
+         rauc_board_compatible=${rauc_os_compatible/generic-x86-64/intel-nuc}
+         if [ "${rauc_board_compatible}" = "$RAUC_SYSTEM_COMPATIBLE" ]; then
+             exit 0
+         fi
+         echo "Compatible does not match!" 1>&2
+         exit 10
+         ;;
+    slot-install)
+        if [ "${RAUC_SLOT_CLASS}" = "boot" ]; then
+            install_boot
+        elif [ "${RAUC_SLOT_CLASS}" = "spl" ]; then
+            install_spl
+        fi
+        ;;
+    slot-post-install)
+        if [ "${RAUC_SLOT_CLASS}" = "kernel" ]; then
+            post_install_kernel
+        fi
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+
+exit 0
